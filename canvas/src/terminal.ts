@@ -2,13 +2,26 @@ import { spawn, spawnSync } from "child_process";
 
 export interface TerminalEnvironment {
   inTmux: boolean;
+  inGhostty: boolean;
+  isMacOS: boolean;
   summary: string;
 }
 
 export function detectTerminal(): TerminalEnvironment {
   const inTmux = !!process.env.TMUX;
-  const summary = inTmux ? "tmux" : "no tmux";
-  return { inTmux, summary };
+  const inGhostty = process.env.TERM_PROGRAM === "ghostty";
+  const isMacOS = process.platform === "darwin";
+
+  let summary = "";
+  if (inGhostty && isMacOS) {
+    summary = "ghostty (macOS)";
+  } else if (inTmux) {
+    summary = "tmux";
+  } else {
+    summary = "unsupported";
+  }
+
+  return { inTmux, inGhostty, isMacOS, summary };
 }
 
 export interface SpawnResult {
@@ -28,10 +41,6 @@ export async function spawnCanvas(
   options?: SpawnOptions
 ): Promise<SpawnResult> {
   const env = detectTerminal();
-
-  if (!env.inTmux) {
-    throw new Error("Canvas requires tmux. Please run inside a tmux session.");
-  }
 
   // Get the directory of this script (skill directory)
   const scriptDir = import.meta.dir.replace("/src", "");
@@ -53,13 +62,47 @@ export async function spawnCanvas(
     command += ` --scenario ${options.scenario}`;
   }
 
-  const result = await spawnTmux(command);
-  if (result) return { method: "tmux" };
+  // Try Ghostty first (macOS only), then fall back to tmux
+  if (env.inGhostty && env.isMacOS) {
+    const result = await spawnGhostty(command);
+    if (result) return { method: "ghostty" };
+  }
 
-  throw new Error("Failed to spawn tmux pane");
+  if (env.inTmux) {
+    const result = await spawnTmux(command);
+    if (result) return { method: "tmux" };
+  }
+
+  throw new Error(
+    "Canvas requires Ghostty (macOS) or tmux. Please run inside one of these environments."
+  );
 }
 
-// File to track the canvas pane ID
+async function spawnGhostty(command: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const script = `
+      tell application "Ghostty"
+        activate
+      end tell
+      delay 0.1
+      tell application "System Events"
+        tell process "Ghostty"
+          keystroke "d" using {command down}
+          delay 0.3
+          keystroke "${command.replace(/"/g, '\\"').replace(/\\/g, "\\\\")}"
+          delay 0.05
+          key code 36
+        end tell
+      end tell
+    `;
+
+    const proc = spawn("osascript", ["-e", script]);
+    proc.on("close", (code) => resolve(code === 0));
+    proc.on("error", () => resolve(false));
+  });
+}
+
+// File to track the canvas pane ID (for tmux)
 const CANVAS_PANE_FILE = "/tmp/claude-canvas-pane-id";
 
 async function getCanvasPaneId(): Promise<string | null> {
